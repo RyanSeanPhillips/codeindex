@@ -12,9 +12,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
+from ..config import ProjectConfig
 from ..core.indexer import Indexer
 from ..core.query import QueryEngine
 from ..core.differ import Differ
+from ..rules.conventions import check_conventions
 from ..rules.engine import RuleEngine
 from ..sessions.tracker import SessionTracker
 from ..sessions.history import SessionHistory
@@ -92,7 +94,7 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run", "list", "add_rule", "rate", "effectiveness"],
+                    "enum": ["run", "list", "add_rule", "rate", "effectiveness", "test_rule"],
                     "default": "list",
                     "description": "Action to perform",
                 },
@@ -103,6 +105,8 @@ TOOLS = [
                 "rule_name": {"type": "string", "description": "Name for new rule (add_rule)"},
                 "rule_sql": {"type": "string", "description": "SQL query for new rule (add_rule)"},
                 "useful": {"type": "boolean", "description": "Rate a rule run as useful (rate)"},
+                "weight": {"type": "number", "description": "Importance weight for new rule (add_rule)", "default": 1.0},
+                "learned_from": {"type": "string", "description": "Source of this rule (add_rule), e.g. 'CLAUDE.md'"},
             },
         },
     },
@@ -136,6 +140,14 @@ TOOLS = [
             },
         },
     },
+    {
+        "name": "check_conventions",
+        "description": "Check architectural layer boundary violations. Requires layers defined in .codeindex.yaml.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 
@@ -144,10 +156,11 @@ class MCPServer:
 
     def __init__(self, project_root: Path, db_path: Optional[Path] = None):
         self.project_root = project_root.resolve()
+        self.config = ProjectConfig.load(self.project_root)
         if db_path is None:
             db_path = self.project_root / ".codeindex.db"
         self.db = Database(db_path)
-        self.indexer = Indexer(self.db, self.project_root)
+        self.indexer = Indexer(self.db, self.project_root, config=self.config)
         self.query = QueryEngine(self.db)
         self.rules = RuleEngine(self.db)
         self.differ = Differ(self.db, self.indexer)
@@ -206,6 +219,14 @@ class MCPServer:
         elif name == "session":
             return self._handle_session(args)
 
+        elif name == "check_conventions":
+            violations = check_conventions(self.db, self.config)
+            return {
+                "violations": violations,
+                "total": len(violations),
+                "has_layers": bool(self.config.layers),
+            }
+
         else:
             raise ValueError(f"Unknown tool: {name}")
 
@@ -236,8 +257,17 @@ class MCPServer:
             rule = self.rules.add_rule(
                 rule_id, rule_name, rule_sql,
                 severity=args.get("severity", "warning"),
+                weight=args.get("weight", 1.0),
+                learned_from=args.get("learned_from"),
             )
             return {"rule_id": rule.rule_id, "name": rule.name, "status": "created"}
+
+        elif action == "test_rule":
+            rule_sql = args.get("rule_sql", "")
+            if not rule_sql:
+                raise ValueError("rule_sql required for test_rule")
+            rows = self.rules.test_rule(rule_sql)
+            return {"preview": rows, "count": len(rows)}
 
         elif action == "rate":
             rule_id = args.get("rule_id", "")

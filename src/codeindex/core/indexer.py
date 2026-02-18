@@ -45,7 +45,12 @@ class Indexer:
     def __init__(self, db: Database, project_root: Path, config: Optional[dict] = None):
         self.db = db
         self.project_root = project_root.resolve()
-        self.config = config or {}
+        # Accept both dict config and ProjectConfig
+        if config is not None and hasattr(config, "ignore"):
+            # ProjectConfig object
+            self.config = {"ignore": config.ignore}
+        else:
+            self.config = config or {}
         self._ignore_spec = self._build_ignore_spec()
 
     def _build_ignore_spec(self) -> Optional[pathspec.PathSpec]:

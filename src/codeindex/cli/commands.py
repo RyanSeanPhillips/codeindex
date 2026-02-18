@@ -11,9 +11,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
+from ..config import ProjectConfig
 from ..core.indexer import Indexer
 from ..core.query import QueryEngine
 from ..core.differ import Differ
+from ..rules.conventions import check_conventions
 from ..rules.engine import RuleEngine
 from ..rules.seed import seed_from_instructions
 from ..sessions.tracker import SessionTracker
@@ -30,10 +32,17 @@ def _get_db(args) -> tuple[Database, Path]:
     return db, project_root
 
 
+def _get_config(args) -> ProjectConfig:
+    """Load project config from .codeindex.yaml."""
+    project_root = Path(args.project).resolve()
+    return ProjectConfig.load(project_root)
+
+
 def cmd_init(args):
     """Build the full index."""
     db, root = _get_db(args)
-    indexer = Indexer(db, root)
+    config = _get_config(args)
+    indexer = Indexer(db, root, config=config)
     rules = RuleEngine(db)
     rules.seed_builtins()
     seed_from_instructions(db, root)
@@ -52,7 +61,8 @@ def cmd_init(args):
 def cmd_update(args):
     """Incremental index update."""
     db, root = _get_db(args)
-    indexer = Indexer(db, root)
+    config = _get_config(args)
+    indexer = Indexer(db, root, config=config)
     result = indexer.incremental()
 
     total = sum(result.values())
@@ -152,6 +162,26 @@ def cmd_stats(args):
     db.close()
 
 
+def cmd_conventions(args):
+    """Check architectural layer boundary violations."""
+    db, root = _get_db(args)
+    config = _get_config(args)
+
+    if not config.layers:
+        print("No layers defined in .codeindex.yaml. Nothing to check.")
+        db.close()
+        return
+
+    violations = check_conventions(db, config)
+    if not violations:
+        print(f"No layer violations found ({len(config.layers)} layers checked).")
+    else:
+        print(f"Layer violations ({len(violations)}):")
+        for v in violations:
+            print(f"  {v['file']}:{v['line_no']} - {v['message']}")
+    db.close()
+
+
 def cmd_serve(args):
     """Start the MCP server."""
     from ..server.mcp import MCPServer
@@ -212,6 +242,9 @@ def build_parser() -> argparse.ArgumentParser:
     # stats
     sub.add_parser("stats", help="Show index statistics")
 
+    # check-conventions
+    sub.add_parser("check-conventions", help="Check layer boundary violations")
+
     # serve
     sub.add_parser("serve", help="Start MCP server")
 
@@ -236,6 +269,7 @@ def run_cli(argv: Optional[list[str]] = None):
         "file": cmd_file,
         "diagnostics": cmd_diagnostics,
         "stats": cmd_stats,
+        "check-conventions": cmd_conventions,
         "serve": cmd_serve,
     }
 

@@ -92,7 +92,9 @@ CREATE TABLE IF NOT EXISTS rules (
     sql         TEXT NOT NULL,
     is_builtin  INTEGER NOT NULL DEFAULT 1,
     enabled     INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    weight      REAL NOT NULL DEFAULT 1.0,
+    learned_from TEXT
 );
 
 -- Rule execution history

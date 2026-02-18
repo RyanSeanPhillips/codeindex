@@ -122,7 +122,8 @@ class RuleEngine:
             return f"{rule.name}: {qual_name}" if qual_name else rule.name
 
     def add_rule(self, rule_id: str, name: str, sql: str,
-                 severity: str = "warning", description: str = "") -> Rule:
+                 severity: str = "warning", description: str = "",
+                 weight: float = 1.0, learned_from: Optional[str] = None) -> Rule:
         """Add a custom analysis rule."""
         rule = Rule(
             rule_id=rule_id,
@@ -133,9 +134,19 @@ class RuleEngine:
             is_builtin=False,
             enabled=True,
             created_at=datetime.now().isoformat(),
+            weight=weight,
+            learned_from=learned_from,
         )
         self.db.upsert_rule(rule)
         return rule
+
+    def test_rule(self, sql: str) -> list[dict[str, Any]]:
+        """Dry-run a rule SQL without storing results. Returns raw query output."""
+        try:
+            rows = self.db.execute_sql(sql)
+            return rows[:50]  # Cap preview at 50 rows
+        except Exception as e:
+            return [{"error": str(e)}]
 
     def rate_rule(self, rule_id: str, useful: bool) -> None:
         """Rate the most recent run of a rule as useful or not."""

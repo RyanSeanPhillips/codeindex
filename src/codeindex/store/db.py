@@ -37,6 +37,15 @@ class Database:
     def _init_schema(self):
         self._conn.executescript(SCHEMA_SQL)
         self._conn.execute(INIT_META_SQL, (str(SCHEMA_VERSION),))
+        self._migrate_rules_columns()
+
+    def _migrate_rules_columns(self):
+        """Add weight and learned_from columns to rules table if missing."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(rules)").fetchall()}
+        if "weight" not in cols:
+            self._conn.execute("ALTER TABLE rules ADD COLUMN weight REAL NOT NULL DEFAULT 1.0")
+        if "learned_from" not in cols:
+            self._conn.execute("ALTER TABLE rules ADD COLUMN learned_from TEXT")
 
     @contextmanager
     def transaction(self):
@@ -184,6 +193,9 @@ class Database:
         )
 
     def get_callers(self, function_name: str, limit: int = 50) -> list[dict[str, Any]]:
+        # Match callee_expr where the final segment (after last '.') equals function_name,
+        # OR the entire expression equals function_name (bare call).
+        # This prevents "load_file" from matching "_on_single_file_loaded".
         rows = self._conn.execute(
             """SELECT c.*, f.rel_path,
                       s.name as caller_name, s.kind as caller_kind,
@@ -192,10 +204,11 @@ class Database:
                JOIN files f ON c.file_id = f.file_id
                LEFT JOIN symbols s ON c.caller_id = s.symbol_id
                LEFT JOIN symbols p ON s.parent_id = p.symbol_id
-               WHERE c.callee_expr LIKE ?
+               WHERE c.callee_expr = ?
+                  OR c.callee_expr LIKE ?
                ORDER BY f.rel_path, c.line_no
                LIMIT ?""",
-            (f"%{function_name}%", limit),
+            (function_name, f"%.{function_name}", limit),
         ).fetchall()
         return [{
             "file": r["rel_path"],
@@ -241,26 +254,23 @@ class Database:
 
     def upsert_rule(self, r: Rule) -> None:
         self._conn.execute(
-            """INSERT INTO rules (rule_id, name, description, severity, sql, is_builtin, enabled, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO rules (rule_id, name, description, severity, sql, is_builtin, enabled, created_at, weight, learned_from)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(rule_id) DO UPDATE SET
                  name=excluded.name, description=excluded.description,
                  severity=excluded.severity, sql=excluded.sql,
-                 enabled=excluded.enabled""",
+                 enabled=excluded.enabled, weight=excluded.weight,
+                 learned_from=excluded.learned_from""",
             (r.rule_id, r.name, r.description, r.severity, r.sql,
-             1 if r.is_builtin else 0, 1 if r.enabled else 0, r.created_at or self._now()),
+             1 if r.is_builtin else 0, 1 if r.enabled else 0, r.created_at or self._now(),
+             r.weight, r.learned_from),
         )
 
     def get_rule(self, rule_id: str) -> Optional[Rule]:
         row = self._conn.execute("SELECT * FROM rules WHERE rule_id = ?", (rule_id,)).fetchone()
         if not row:
             return None
-        return Rule(
-            rule_id=row["rule_id"], name=row["name"], description=row["description"],
-            severity=row["severity"], sql=row["sql"],
-            is_builtin=bool(row["is_builtin"]), enabled=bool(row["enabled"]),
-            created_at=row["created_at"],
-        )
+        return self._row_to_rule(row)
 
     def list_rules(self, enabled_only: bool = True) -> list[Rule]:
         sql = "SELECT * FROM rules"
@@ -268,12 +278,17 @@ class Database:
             sql += " WHERE enabled = 1"
         sql += " ORDER BY rule_id"
         rows = self._conn.execute(sql).fetchall()
-        return [Rule(
-            rule_id=r["rule_id"], name=r["name"], description=r["description"],
-            severity=r["severity"], sql=r["sql"],
-            is_builtin=bool(r["is_builtin"]), enabled=bool(r["enabled"]),
-            created_at=r["created_at"],
-        ) for r in rows]
+        return [self._row_to_rule(r) for r in rows]
+
+    def _row_to_rule(self, row) -> Rule:
+        return Rule(
+            rule_id=row["rule_id"], name=row["name"], description=row["description"],
+            severity=row["severity"], sql=row["sql"],
+            is_builtin=bool(row["is_builtin"]), enabled=bool(row["enabled"]),
+            created_at=row["created_at"],
+            weight=row["weight"] if "weight" in row.keys() else 1.0,
+            learned_from=row["learned_from"] if "learned_from" in row.keys() else None,
+        )
 
     def insert_rule_run(self, run: RuleRun) -> None:
         self._conn.execute(

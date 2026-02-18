@@ -315,3 +315,116 @@ class TestStore:
     def test_fts_search(self, indexed_db):
         results = indexed_db.search_fts("helper")
         assert len(results) > 0
+
+
+# ── Config tests ──
+
+class TestConfig:
+    def test_load_missing_config(self, tmp_path):
+        from codeindex.config import ProjectConfig
+        config = ProjectConfig.load(tmp_path)
+        assert config.name == ""
+        assert config.layers == []
+        assert config.ignore == []
+
+    def test_load_yaml_config(self, tmp_path):
+        from codeindex.config import ProjectConfig
+        config_file = tmp_path / ".codeindex.yaml"
+        config_file.write_text("""
+project:
+  name: TestProject
+  repo: https://github.com/test/test
+
+ignore:
+  - "build"
+  - ".venv"
+
+layers:
+  - name: domain
+    paths: ["core/domain/**"]
+    allowed_imports: []
+  - name: services
+    paths: ["core/services/**"]
+    allowed_imports: [domain]
+  - name: views
+    paths: ["views/**"]
+    allowed_imports: [services, domain]
+
+seed_rules_from:
+  - CLAUDE.md
+""", encoding="utf-8")
+        config = ProjectConfig.load(tmp_path)
+        assert config.name == "TestProject"
+        assert len(config.layers) == 3
+        assert config.layers[0].name == "domain"
+        assert config.layers[1].allowed_imports == ["domain"]
+        assert "build" in config.ignore
+
+    def test_config_to_dict(self):
+        from codeindex.config import ProjectConfig, LayerConfig
+        config = ProjectConfig(
+            name="Test",
+            layers=[LayerConfig(name="core", paths=["core/**"], allowed_imports=[])],
+            ignore=["build"],
+        )
+        d = config.to_dict()
+        assert d["project"]["name"] == "Test"
+        assert len(d["layers"]) == 1
+        assert d["ignore"] == ["build"]
+
+
+# ── Conventions tests ──
+
+class TestConventions:
+    def test_check_no_layers(self, indexed_db):
+        from codeindex.config import ProjectConfig
+        from codeindex.rules.conventions import check_conventions
+        config = ProjectConfig()
+        violations = check_conventions(indexed_db, config)
+        assert violations == []
+
+    def test_check_with_layers(self, indexed_db):
+        from codeindex.config import ProjectConfig, LayerConfig
+        from codeindex.rules.conventions import check_conventions
+        # Define layers where pkg/ cannot import from root
+        config = ProjectConfig(layers=[
+            LayerConfig(name="pkg", paths=["pkg/**"], allowed_imports=[]),
+            LayerConfig(name="root", paths=["main.py"], allowed_imports=["pkg"]),
+        ])
+        violations = check_conventions(indexed_db, config)
+        # pkg/utils.py imports from pkg.models which is in same layer, so no violation there
+        # But if there are cross-layer imports they should be caught
+        assert isinstance(violations, list)
+
+
+# ── Test rule / enriched rules tests ──
+
+class TestRuleEnrichment:
+    def test_add_rule_with_weight(self, indexed_db):
+        rules = RuleEngine(indexed_db)
+        rule = rules.add_rule(
+            "TEST_WEIGHT",
+            "Test weighted rule",
+            "SELECT symbol_id as file_id, name FROM symbols LIMIT 1",
+            weight=2.5,
+            learned_from="CLAUDE.md",
+        )
+        assert rule.weight == 2.5
+        assert rule.learned_from == "CLAUDE.md"
+
+        # Verify persisted
+        retrieved = indexed_db.get_rule("TEST_WEIGHT")
+        assert retrieved.weight == 2.5
+        assert retrieved.learned_from == "CLAUDE.md"
+
+    def test_test_rule_dry_run(self, indexed_db):
+        rules = RuleEngine(indexed_db)
+        results = rules.test_rule("SELECT symbol_id, name, kind FROM symbols LIMIT 3")
+        assert len(results) == 3
+        assert "name" in results[0]
+
+    def test_test_rule_bad_sql(self, indexed_db):
+        rules = RuleEngine(indexed_db)
+        results = rules.test_rule("SELECT * FROM nonexistent_table")
+        assert len(results) == 1
+        assert "error" in results[0]

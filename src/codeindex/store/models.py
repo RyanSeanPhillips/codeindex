@@ -92,6 +92,8 @@ class Rule:
     is_builtin: bool = True
     enabled: bool = True
     created_at: str = ""
+    weight: float = 1.0  # importance multiplier (AI-adjustable)
+    learned_from: Optional[str] = None  # e.g. "CLAUDE.md", "user feedback", "session:42"
 
 
 @dataclass
