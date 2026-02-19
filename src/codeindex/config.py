@@ -33,6 +33,7 @@ class ProjectConfig:
     ignore: list[str] = field(default_factory=list)
     layers: list[LayerConfig] = field(default_factory=list)
     seed_rules_from: list[str] = field(default_factory=list)
+    inline_source_max_lines: int = 0  # 0 = disabled; include source for functions <= N lines
 
     @classmethod
     def load(cls, project_root: Path) -> "ProjectConfig":
@@ -64,6 +65,8 @@ class ProjectConfig:
                 description=layer.get("description", ""),
             ))
 
+        context = data.get("context", {})
+
         return cls(
             name=project.get("name", ""),
             repo=project.get("repo", ""),
@@ -71,6 +74,7 @@ class ProjectConfig:
             ignore=data.get("ignore", []),
             layers=layers,
             seed_rules_from=data.get("seed_rules_from", []),
+            inline_source_max_lines=int(context.get("inline_source_max_lines", 0)),
         )
 
     def to_dict(self) -> dict[str, Any]:

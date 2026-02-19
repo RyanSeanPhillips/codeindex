@@ -8,6 +8,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from pathlib import Path
+
 from ..store.db import Database
 
 
@@ -37,8 +39,11 @@ class SymbolContext:
 class QueryEngine:
     """Assemble structured context from the index."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, project_root: Optional[Path] = None,
+                 inline_source_max_lines: int = 0):
         self.db = db
+        self.project_root = project_root
+        self.inline_source_max_lines = inline_source_max_lines
 
     def get_context(self, name: str, kind: Optional[str] = None) -> SymbolContext:
         """THE primary tool: get everything about a symbol.
@@ -118,6 +123,14 @@ class QueryEngine:
                 "line_start": s["line_start"], "line_end": s["line_end"],
             } for s in sibling_rows]
 
+        # Inline source for small symbols
+        if self.inline_source_max_lines > 0:
+            line_count = sym.get("line_end", 0) - sym.get("line_start", 0) + 1
+            if line_count <= self.inline_source_max_lines:
+                source = self._read_source(sym.get("file", ""), sym.get("line_start", 0), sym.get("line_end", 0))
+                if source:
+                    ctx.symbol["source"] = source
+
         return ctx
 
     def get_callers(self, name: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -159,6 +172,18 @@ class QueryEngine:
             categorized.append(c)
 
         return categorized
+
+    def _read_source(self, rel_path: str, line_start: int, line_end: int) -> Optional[str]:
+        """Read source lines from a file. Returns None if file can't be read."""
+        if not self.project_root or not rel_path:
+            return None
+        try:
+            full_path = self.project_root / rel_path
+            lines = full_path.read_text(encoding="utf-8").splitlines()
+            # line numbers are 1-indexed
+            return "\n".join(lines[line_start - 1:line_end])
+        except Exception:
+            return None
 
     def get_impact(self, name: str) -> dict[str, Any]:
         """What breaks if I change this symbol?

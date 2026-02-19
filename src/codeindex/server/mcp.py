@@ -173,7 +173,11 @@ class MCPServer:
             db_path = self.project_root / ".codeindex.db"
         self.db = Database(db_path)
         self.indexer = Indexer(self.db, self.project_root, config=self.config)
-        self.query = QueryEngine(self.db)
+        self.query = QueryEngine(
+            self.db,
+            project_root=self.project_root,
+            inline_source_max_lines=self.config.inline_source_max_lines,
+        )
         self.rules = RuleEngine(self.db)
         self.differ = Differ(self.db, self.indexer)
         self.sessions = SessionTracker(self.db)

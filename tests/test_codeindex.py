@@ -543,3 +543,25 @@ class TestDiagnosticsFiltering:
         engine.run_all()
         diags = indexed_db.get_diagnostics(file_pattern="nonexistent.py")
         assert len(diags) == 0
+
+
+# ── Inline source tests ──
+
+class TestInlineSource:
+    def test_disabled_by_default(self, indexed_db):
+        query = QueryEngine(indexed_db, project_root=FIXTURE_DIR, inline_source_max_lines=0)
+        ctx = query.get_context("helper_function")
+        assert "source" not in ctx.symbol
+
+    def test_short_function_included(self, indexed_db):
+        query = QueryEngine(indexed_db, project_root=FIXTURE_DIR, inline_source_max_lines=15)
+        ctx = query.get_context("helper_function")
+        # helper_function is 3 lines — should be inlined
+        assert "source" in ctx.symbol
+        assert "Hello" in ctx.symbol["source"]
+
+    def test_long_function_excluded(self, indexed_db):
+        query = QueryEngine(indexed_db, project_root=FIXTURE_DIR, inline_source_max_lines=15)
+        ctx = query.get_context("a_very_long_method_that_exceeds_fifty_lines")
+        # This method is ~68 lines — should NOT be inlined
+        assert "source" not in ctx.symbol
