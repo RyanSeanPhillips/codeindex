@@ -209,7 +209,9 @@ def cmd_conventions(args):
 def cmd_serve(args):
     """Start the MCP server."""
     from ..server.mcp import MCPServer
-    root = Path(args.project).resolve()
+    # Accept --project from either parent parser or serve subparser
+    project = getattr(args, "project", None) or "."
+    root = Path(project).resolve()
     server = MCPServer(root)
     server.run()
 
@@ -276,7 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check-conventions", help="Check layer boundary violations")
 
     # serve
-    sub.add_parser("serve", help="Start MCP server")
+    p = sub.add_parser("serve", help="Start MCP server")
+    p.add_argument("--project", "-p", default=None, help="Project root (overrides global --project)")
 
     return parser
 
