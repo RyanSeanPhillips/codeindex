@@ -16,6 +16,8 @@ DEAD_SYMBOL = Rule(
         JOIN files f ON s.file_id = f.file_id
         WHERE s.kind IN ('function', 'method')
           AND s.name NOT LIKE '\\_%' ESCAPE '\\'
+          AND s.decorators_json NOT LIKE '%property%'
+          AND s.decorators_json NOT LIKE '%.setter%'
           AND s.symbol_id NOT IN (
               SELECT DISTINCT c.caller_id FROM calls c WHERE c.caller_id IS NOT NULL
           )
