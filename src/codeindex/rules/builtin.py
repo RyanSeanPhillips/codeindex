@@ -21,14 +21,10 @@ DEAD_SYMBOL = Rule(
           AND s.symbol_id NOT IN (
               SELECT DISTINCT c.caller_id FROM calls c WHERE c.caller_id IS NOT NULL
           )
-          AND s.name NOT IN (
-              SELECT DISTINCT
-                  CASE
-                      WHEN INSTR(c.callee_expr, '.') > 0
-                      THEN SUBSTR(c.callee_expr, INSTR(c.callee_expr, '.') + 1)
-                      ELSE c.callee_expr
-                  END
-              FROM calls c
+          AND NOT EXISTS (
+              SELECT 1 FROM calls c
+              WHERE c.callee_expr = s.name
+                 OR c.callee_expr LIKE '%.' || s.name
           )
     """,
 )
