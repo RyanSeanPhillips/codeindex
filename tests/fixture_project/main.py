@@ -2,6 +2,7 @@
 
 from pkg.utils import helper_function, unused_function
 from pkg.models import User
+from pkg.manager import DataManager
 
 
 def main():
@@ -10,6 +11,12 @@ def main():
     result = helper_function(user.name)
     process_result(result)
     return result
+
+
+def load_workflow():
+    """Uses DataManager.load_data from main.py."""
+    mgr = DataManager()
+    return mgr.load_data("/some/path")
 
 
 def process_result(data):

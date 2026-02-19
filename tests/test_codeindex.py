@@ -565,3 +565,67 @@ class TestInlineSource:
         ctx = query.get_context("a_very_long_method_that_exceeds_fifty_lines")
         # This method is ~68 lines — should NOT be inlined
         assert "source" not in ctx.symbol
+
+
+# ── get_context exact match tests ──
+
+class TestExactMatch:
+    def test_exact_match_preferred(self, indexed_db):
+        """get_context should resolve to exact name match, not fuzzy."""
+        query = QueryEngine(indexed_db)
+        # "reset" is an exact method on DataManager
+        ctx = query.get_context("reset")
+        assert ctx.symbol.get("name") == "reset"
+
+    def test_exact_match_not_confused_by_substring(self, indexed_db):
+        """_internal_helper should not resolve to helper_function."""
+        query = QueryEngine(indexed_db)
+        ctx = query.get_context("_internal_helper")
+        assert ctx.symbol.get("name") == "_internal_helper"
+
+    def test_fuzzy_fallback_still_works(self, indexed_db):
+        """If no exact match, fuzzy should still find results."""
+        query = QueryEngine(indexed_db)
+        ctx = query.get_context("helper_func")  # substring of helper_function
+        assert ctx.symbol.get("name") == "helper_function"
+
+
+# ── get_impact class aggregation tests ──
+
+class TestClassImpact:
+    def test_class_impact_aggregates_members(self, indexed_db):
+        """get_impact on a class should find callers of its member methods."""
+        query = QueryEngine(indexed_db)
+        result = query.get_impact("DataManager")
+        assert result.get("kind") == "class"
+        # Should find callers from both main.py and consumer.py
+        files = result["files_affected"]
+        file_basenames = {f.split("/")[-1].split("\\")[-1] for f in files}
+        assert "main.py" in file_basenames, f"Expected main.py in {files}"
+        assert "consumer.py" in file_basenames, f"Expected consumer.py in {files}"
+
+    def test_class_impact_excludes_self_calls(self, indexed_db):
+        """Class-level impact should not include methods calling each other within the class."""
+        query = QueryEngine(indexed_db)
+        result = query.get_impact("DataManager")
+        # No caller should be from DataManager itself
+        for caller in result["direct_callers"]:
+            assert caller.get("caller_class") != "DataManager", \
+                f"Self-call found: {caller}"
+
+    def test_class_impact_by_member(self, indexed_db):
+        """direct_callers_by_member should group callers by which method they call."""
+        query = QueryEngine(indexed_db)
+        result = query.get_impact("DataManager")
+        by_member = result.get("direct_callers_by_member", {})
+        # load_data is called from main.py
+        assert "load_data" in by_member, f"Expected load_data in {by_member.keys()}"
+        # save_data is called from consumer.py
+        assert "save_data" in by_member, f"Expected save_data in {by_member.keys()}"
+
+    def test_non_class_impact_unchanged(self, indexed_db):
+        """get_impact on a function should behave as before (no 'kind' key)."""
+        query = QueryEngine(indexed_db)
+        result = query.get_impact("helper_function")
+        assert "kind" not in result
+        assert "members_analyzed" not in result

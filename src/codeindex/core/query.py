@@ -50,19 +50,24 @@ class QueryEngine:
 
         Returns callers, callees, refs, annotations, diagnostics, siblings.
         """
-        # Find the symbol
-        symbols = self.db.find_symbols(name=name, kind=kind, limit=1)
-        if not symbols:
-            # Try exact match
-            rows = self.db._conn.execute(
-                "SELECT s.*, f.rel_path, p.name as parent_name, p.kind as parent_kind "
-                "FROM symbols s JOIN files f ON s.file_id = f.file_id "
-                "LEFT JOIN symbols p ON s.parent_id = p.symbol_id "
-                "WHERE s.name = ? LIMIT 1",
-                (name,),
-            ).fetchall()
-            if rows:
-                symbols = [self.db._symbol_row_to_dict(rows[0])]
+        # Find the symbol — exact match first, then fuzzy fallback
+        sql = (
+            "SELECT s.*, f.rel_path, p.name as parent_name, p.kind as parent_kind "
+            "FROM symbols s JOIN files f ON s.file_id = f.file_id "
+            "LEFT JOIN symbols p ON s.parent_id = p.symbol_id "
+            "WHERE s.name = ?"
+        )
+        params: list = [name]
+        if kind:
+            sql += " AND s.kind = ?"
+            params.append(kind)
+        sql += " LIMIT 5"
+        rows = self.db._conn.execute(sql, params).fetchall()
+        if rows:
+            symbols = [self.db._symbol_row_to_dict(r) for r in rows]
+        else:
+            # Fuzzy fallback only if exact match fails
+            symbols = self.db.find_symbols(name=name, kind=kind, limit=5)
 
         if not symbols:
             return SymbolContext()
@@ -189,8 +194,18 @@ class QueryEngine:
         """What breaks if I change this symbol?
 
         Returns direct callers, transitive callers (2 hops), and files affected.
+        For classes, aggregates callers across all member methods.
         """
-        # Direct callers
+        # Check if this is a class — if so, aggregate callers of all members
+        class_row = self.db._conn.execute(
+            "SELECT symbol_id FROM symbols WHERE name = ? AND kind = 'class' LIMIT 1",
+            (name,),
+        ).fetchone()
+
+        if class_row:
+            return self._get_class_impact(name, class_row["symbol_id"])
+
+        # Direct callers for a single symbol
         direct = self.db.get_callers(name, limit=50)
         direct_names = {c["caller_name"] for c in direct if c["caller_name"]}
         direct_files = {c["file"] for c in direct}
@@ -214,6 +229,68 @@ class QueryEngine:
             "transitive_callers": transitive[:30],
             "files_affected": sorted(all_files),
             "impact_score": len(direct) + len(transitive) * 0.5,
+        }
+
+    def _get_class_impact(self, class_name: str, class_id: int) -> dict[str, Any]:
+        """Aggregate callers across all members of a class, excluding self-calls."""
+        # Get all member method names
+        member_rows = self.db._conn.execute(
+            "SELECT name FROM symbols WHERE parent_id = ? AND kind IN ('method', 'function')",
+            (class_id,),
+        ).fetchall()
+        member_names = {r["name"] for r in member_rows}
+
+        # Also get callers of the class itself (constructor calls)
+        all_direct = []
+        seen_callers = set()  # (caller_name, file, line_no) to deduplicate
+
+        for method_name in [class_name] + sorted(member_names):
+            callers = self.db.get_callers(method_name, limit=50)
+            for c in callers:
+                # Skip self-calls (methods within the same class calling each other)
+                if c.get("caller_class") == class_name:
+                    continue
+                key = (c.get("caller_name"), c.get("file"), c.get("line_no"))
+                if key not in seen_callers:
+                    seen_callers.add(key)
+                    c["via_member"] = method_name if method_name != class_name else "__init__"
+                    all_direct.append(c)
+
+        direct_names = {c["caller_name"] for c in all_direct if c["caller_name"]}
+        direct_files = {c["file"] for c in all_direct if c.get("file")}
+
+        # Transitive callers (1 more hop)
+        transitive = []
+        transitive_files = set()
+        for caller_name in direct_names:
+            if caller_name:
+                indirect = self.db.get_callers(caller_name, limit=20)
+                for c in indirect:
+                    if c["caller_name"] not in direct_names and c["caller_name"] not in member_names:
+                        key = (c.get("caller_name"), c.get("file"), c.get("line_no"))
+                        if key not in seen_callers:
+                            seen_callers.add(key)
+                            transitive.append(c)
+                            if c.get("file"):
+                                transitive_files.add(c["file"])
+
+        all_files = direct_files | transitive_files
+
+        # Group direct callers by member for structured output
+        by_member: dict[str, list] = {}
+        for c in all_direct:
+            member = c.pop("via_member", "unknown")
+            by_member.setdefault(member, []).append(c)
+
+        return {
+            "symbol": class_name,
+            "kind": "class",
+            "members_analyzed": sorted(member_names),
+            "direct_callers": all_direct,
+            "direct_callers_by_member": by_member,
+            "transitive_callers": transitive[:30],
+            "files_affected": sorted(all_files),
+            "impact_score": len(all_direct) + len(transitive) * 0.5,
         }
 
     def search(self, query: str, kind: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
