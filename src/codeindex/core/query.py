@@ -69,8 +69,9 @@ class QueryEngine:
         # Callers — who calls this symbol?
         ctx.callers = self.db.get_callers(name, limit=30)
 
-        # Callees — what does this symbol call?
-        ctx.callees = self.db.get_callees(sid)
+        # Callees — what does this symbol call? (categorized)
+        raw_callees = self.db.get_callees(sid)
+        ctx.callees = self._categorize_callees(raw_callees)
 
         # Refs — attribute references within this symbol
         ref_rows = self.db._conn.execute(
@@ -119,6 +120,46 @@ class QueryEngine:
 
         return ctx
 
+    def get_callers(self, name: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Direct wrapper for callers query — exposed as standalone tool."""
+        return self.db.get_callers(name, limit=limit)
+
+    def _categorize_callees(self, callees: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Categorize callees into groups: state, self_method, external, stdlib/builtin."""
+        # Known Python builtins and common stdlib
+        _BUILTINS = {
+            "print", "len", "range", "int", "str", "float", "bool", "list", "dict",
+            "tuple", "set", "type", "isinstance", "issubclass", "hasattr", "getattr",
+            "setattr", "super", "enumerate", "zip", "map", "filter", "sorted", "reversed",
+            "min", "max", "sum", "abs", "round", "any", "all", "next", "iter",
+            "open", "repr", "id", "hash", "callable", "vars", "dir",
+        }
+
+        categorized = []
+        for c in callees:
+            expr = c.get("callee_expr", "")
+            parts = expr.split(".")
+
+            if parts[0] == "self":
+                if len(parts) == 2:
+                    category = "self_method"
+                elif len(parts) >= 3:
+                    category = "self_attr_method"
+                else:
+                    category = "self_method"
+            elif parts[-1] in _BUILTINS or (len(parts) == 1 and parts[0] in _BUILTINS):
+                category = "builtin"
+            elif "." in expr and not expr.startswith("self"):
+                category = "external"
+            else:
+                # Check if it's a known symbol in the index
+                category = "local"
+
+            c["category"] = category
+            categorized.append(c)
+
+        return categorized
+
     def get_impact(self, name: str) -> dict[str, Any]:
         """What breaks if I change this symbol?
 
@@ -151,22 +192,27 @@ class QueryEngine:
         }
 
     def search(self, query: str, kind: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
-        """Combined FTS + structured search."""
+        """Search for symbols by name. Returns only matching symbols, ranked by relevance.
+
+        Scoring: exact name match > prefix match > substring match > FTS file match.
+        """
         results = []
 
-        # FTS search
-        fts_results = self.db.search_fts(query, limit=limit)
-        for r in fts_results:
-            results.append({
-                "type": "file",
-                "rel_path": r["rel_path"],
-                "symbol_names": r["symbol_names"],
-                "score": r["score"],
-            })
-
-        # Symbol search
-        symbols = self.db.find_symbols(name=query, kind=kind, limit=limit)
+        # Symbol search (primary — this is what agents actually want)
+        symbols = self.db.find_symbols(name=query, kind=kind, limit=limit * 2)
         for s in symbols:
+            name = s["name"]
+            # Score: exact > prefix > substring
+            if name == query:
+                score = 100
+            elif name.startswith(query):
+                score = 50
+            elif name.lower() == query.lower():
+                score = 90
+            elif name.lower().startswith(query.lower()):
+                score = 40
+            else:
+                score = 10
             results.append({
                 "type": "symbol",
                 "kind": s["kind"],
@@ -174,14 +220,31 @@ class QueryEngine:
                 "parent_name": s["parent_name"],
                 "file": s["file"],
                 "line_start": s["line_start"],
-                "score": 10,  # Exact match bonus
+                "line_end": s.get("line_end"),
+                "complexity": s.get("complexity"),
+                "docstring": (s.get("docstring") or "")[:100] or None,
+                "score": score,
             })
+
+        # FTS search — only if we have few symbol matches, and only extract
+        # individual symbol names that match (not the whole file)
+        if len(results) < limit:
+            fts_results = self.db.search_fts(query, limit=limit)
+            for r in fts_results:
+                # Don't add FTS results for files we already have symbols from
+                files_seen = {res["file"] for res in results if res.get("file")}
+                if r["rel_path"] not in files_seen:
+                    results.append({
+                        "type": "file",
+                        "file": r["rel_path"],
+                        "score": r["score"] * 0.5,  # Lower priority than symbol matches
+                    })
 
         # Deduplicate and sort by score
         seen = set()
         unique = []
         for r in sorted(results, key=lambda x: x.get("score", 0), reverse=True):
-            key = (r.get("name", ""), r.get("rel_path", r.get("file", "")))
+            key = (r.get("name", ""), r.get("file", r.get("rel_path", "")))
             if key not in seen:
                 seen.add(key)
                 unique.append(r)

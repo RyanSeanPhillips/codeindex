@@ -52,6 +52,18 @@ TOOLS = [
         },
     },
     {
+        "name": "callers",
+        "description": "Who calls this function/method? Returns caller name, class, file, and line number for each call site.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Function or method name to find callers of"},
+                "limit": {"type": "integer", "default": 50},
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "get_impact",
         "description": "What breaks if I change this symbol? Shows direct callers, transitive callers, affected files.",
         "inputSchema": {
@@ -195,6 +207,9 @@ class MCPServer:
         elif name == "get_context":
             ctx = self.query.get_context(args["name"], kind=args.get("kind"))
             return ctx.to_dict()
+
+        elif name == "callers":
+            return self.query.get_callers(args["name"], limit=args.get("limit", 50))
 
         elif name == "get_impact":
             return self.query.get_impact(args["name"])

@@ -77,6 +77,19 @@ def cmd_update(args):
     db.close()
 
 
+def cmd_callers(args):
+    """Show who calls a function/method."""
+    db, root = _get_db(args)
+    query = QueryEngine(db)
+    callers = query.get_callers(args.name, limit=args.limit)
+
+    if args.json:
+        print(json.dumps(callers, indent=2, default=str))
+    else:
+        print(formatter.format_callers(callers, args.name))
+    db.close()
+
+
 def cmd_context(args):
     """Get context for a symbol."""
     db, root = _get_db(args)
@@ -136,15 +149,26 @@ def cmd_diagnostics(args):
 
     if args.run:
         results = rules.run_all()
-        for r in results:
-            if r["findings_count"]:
-                print(f"  {r['rule_id']}: {r['findings_count']} findings")
-        total = sum(r["findings_count"] for r in results)
-        print(f"\nTotal: {total} findings from {len(results)} rules")
+        if args.json:
+            # After running, return the findings filtered by path if specified
+            diags = db.get_diagnostics(
+                severity=args.severity,
+                rule_id=args.rule_id,
+                file_pattern=args.path,
+                limit=args.limit,
+            )
+            print(json.dumps({"run_results": results, "diagnostics": diags}, indent=2, default=str))
+        else:
+            for r in results:
+                if r["findings_count"]:
+                    print(f"  {r['rule_id']}: {r['findings_count']} findings")
+            total = sum(r["findings_count"] for r in results)
+            print(f"\nTotal: {total} findings from {len(results)} rules")
     else:
         diags = db.get_diagnostics(
             severity=args.severity,
             rule_id=args.rule_id,
+            file_pattern=args.path,
             limit=args.limit,
         )
         if args.json:
@@ -213,6 +237,11 @@ def build_parser() -> argparse.ArgumentParser:
     # update
     sub.add_parser("update", help="Incremental index update")
 
+    # callers
+    p = sub.add_parser("callers", help="Show who calls a function/method")
+    p.add_argument("name", help="Function/method name")
+    p.add_argument("--limit", type=int, default=50)
+
     # context
     p = sub.add_parser("context", help="Get context for a symbol")
     p.add_argument("name", help="Symbol name")
@@ -237,6 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", action="store_true", help="Run all rules")
     p.add_argument("--severity", choices=["error", "warning", "info"])
     p.add_argument("--rule-id", help="Filter by rule ID")
+    p.add_argument("--path", help="Filter by file path (substring match)")
     p.add_argument("--limit", type=int, default=50)
 
     # stats
@@ -263,6 +293,7 @@ def run_cli(argv: Optional[list[str]] = None):
     commands = {
         "init": cmd_init,
         "update": cmd_update,
+        "callers": cmd_callers,
         "context": cmd_context,
         "impact": cmd_impact,
         "search": cmd_search,

@@ -119,6 +119,24 @@ def format_diagnostics(diags: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def format_callers(callers: list[dict], symbol_name: str) -> str:
+    """Format callers list for display."""
+    if not callers:
+        return f"No callers found for: {symbol_name}"
+
+    lines = [f"Callers of {symbol_name} ({len(callers)}):"]
+    for c in callers:
+        caller = c.get("caller_name", "?")
+        cclass = c.get("caller_class", "")
+        cqual = f"{cclass}.{caller}" if cclass else caller
+        file = c.get("file", "?")
+        line_no = c.get("line_no", "?")
+        expr = c.get("callee_expr", "")
+        lines.append(f"  {cqual:40s} {file}:{line_no}  ({expr})")
+
+    return "\n".join(lines)
+
+
 def format_impact(impact: dict) -> str:
     """Format impact analysis for display."""
     lines = [f"Impact analysis for: {impact.get('symbol', '?')}"]

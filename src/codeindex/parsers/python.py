@@ -281,6 +281,24 @@ class PythonParser(LanguageParser):
         call._pending_caller = parent_symbol
         result.calls.append(call)
 
+        # Detect .connect(self.method_name) pattern — treat as call to method_name
+        if callee.endswith(".connect"):
+            args_node = node.children[1] if len(node.children) > 1 else None
+            if args_node and args_node.type == "argument_list":
+                for arg in args_node.children:
+                    if arg.type == "attribute":
+                        arg_text = self._node_text(arg, source)
+                        # self.method_name or self.obj.method_name
+                        if arg_text.startswith("self."):
+                            parts = arg_text.split(".")
+                            target_method = parts[-1]
+                            connect_call = Call(
+                                callee_expr=arg_text,
+                                line_no=node.start_point[0] + 1,
+                            )
+                            connect_call._pending_caller = parent_symbol
+                            result.calls.append(connect_call)
+
     def _extract_ts_ref(self, node, source: bytes, result: ParseResult,
                         parent_symbol: Optional[Symbol]):
         full_text = self._node_text(node, source)
@@ -472,6 +490,17 @@ class _ASTVisitor(ast.NodeVisitor):
         call = Call(callee_expr=callee, line_no=node.lineno)
         call._pending_caller = self._current_func
         self.calls.append(call)
+
+        # Detect .connect(self.method_name) — treat as call to the connected method
+        if callee.endswith(".connect") and node.args:
+            for arg in node.args:
+                chain = _attribute_chain(arg)
+                if chain and chain[0] == "self" and len(chain) >= 2:
+                    connected = ".".join(chain)
+                    connect_call = Call(callee_expr=connected, line_no=node.lineno)
+                    connect_call._pending_caller = self._current_func
+                    self.calls.append(connect_call)
+
         self.generic_visit(node)
 
     def visit_Attribute(self, node):

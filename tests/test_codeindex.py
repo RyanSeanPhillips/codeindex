@@ -428,3 +428,118 @@ class TestRuleEnrichment:
         results = rules.test_rule("SELECT * FROM nonexistent_table")
         assert len(results) == 1
         assert "error" in results[0]
+
+
+# ── Signal-aware parsing tests ──
+
+class TestSignalParsing:
+    def test_connect_detected_as_call(self):
+        parser = PythonParser()
+        source = """
+class MyWidget:
+    def __init__(self):
+        self.clicked = Signal()
+        self.clicked.connect(self.on_clicked)
+
+    def on_clicked(self):
+        pass
+"""
+        result = parser.parse(source, "test.py")
+        callee_exprs = {c.callee_expr for c in result.calls}
+        # Should detect both the .connect() call AND the self.on_clicked target
+        assert "self.clicked.connect" in callee_exprs
+        assert "self.on_clicked" in callee_exprs
+
+    def test_connect_in_indexed_project(self, indexed_db):
+        """Test that .connect() targets are found as callers."""
+        callers = indexed_db.get_callers("on_clicked")
+        # __init__ connects self.on_clicked, so it should appear as a caller
+        caller_names = {c["caller_name"] for c in callers}
+        assert "__init__" in caller_names
+
+
+# ── Callers tool tests ──
+
+class TestCallersTool:
+    def test_get_callers_via_query(self, indexed_db):
+        query = QueryEngine(indexed_db)
+        callers = query.get_callers("helper_function")
+        assert len(callers) >= 1
+        caller_names = {c["caller_name"] for c in callers}
+        assert "main" in caller_names
+
+    def test_callers_includes_file_and_line(self, indexed_db):
+        query = QueryEngine(indexed_db)
+        callers = query.get_callers("process_result")
+        assert len(callers) >= 1
+        c = callers[0]
+        assert "file" in c
+        assert "line_no" in c
+        assert "caller_name" in c
+
+
+# ── Categorized callees tests ──
+
+class TestCategorizedCallees:
+    def test_callees_have_category(self, indexed_db):
+        query = QueryEngine(indexed_db)
+        ctx = query.get_context("main")
+        for c in ctx.callees:
+            assert "category" in c
+
+    def test_self_method_category(self, indexed_db):
+        query = QueryEngine(indexed_db)
+        ctx = query.get_context("start", kind="method")
+        categories = {c["category"] for c in ctx.callees}
+        # Application.start calls self._internal_setup() -> self_method
+        assert "self_method" in categories or "local" in categories
+
+
+# ── Search ranking tests ──
+
+class TestSearchRanking:
+    def test_exact_match_first(self, indexed_db):
+        query = QueryEngine(indexed_db)
+        results = query.search("main")
+        assert len(results) > 0
+        # Exact match should be first
+        assert results[0]["name"] == "main"
+        assert results[0]["score"] == 100
+
+    def test_no_file_dump(self, indexed_db):
+        query = QueryEngine(indexed_db)
+        results = query.search("helper")
+        # Should return symbols, not entire file contents
+        for r in results:
+            assert r["type"] in ("symbol", "file")
+            if r["type"] == "symbol":
+                assert "name" in r
+                assert "file" in r
+
+    def test_search_returns_docstring(self, indexed_db):
+        query = QueryEngine(indexed_db)
+        results = query.search("helper_function")
+        symbols = [r for r in results if r["type"] == "symbol"]
+        assert len(symbols) >= 1
+        # Should include truncated docstring
+        assert "docstring" in symbols[0]
+
+
+# ── Diagnostics filtering tests ──
+
+class TestDiagnosticsFiltering:
+    def test_path_filter(self, indexed_db):
+        engine = RuleEngine(indexed_db)
+        engine.seed_builtins()
+        engine.run_all()
+        # Filter to only main.py
+        diags = indexed_db.get_diagnostics(file_pattern="main.py")
+        for d in diags:
+            assert "main.py" in d["file"]
+
+    def test_path_filter_no_results(self, indexed_db):
+        engine = RuleEngine(indexed_db)
+        engine.seed_builtins()
+        engine.run_all()
+        diags = indexed_db.get_diagnostics(file_pattern="nonexistent.py")
+        assert len(diags) == 0
