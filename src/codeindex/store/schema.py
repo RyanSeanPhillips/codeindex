@@ -159,9 +159,19 @@ CREATE TABLE IF NOT EXISTS knowledge (
     updated_at  TEXT NOT NULL
 );
 
--- Full-text search on symbols
+-- Full-text search on symbols (file-level, legacy)
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
     rel_path, symbol_names, docstrings,
+    tokenize='porter unicode61'
+);
+
+-- Symbol-level full-text search
+CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
+    symbol_id UNINDEXED,
+    file_id UNINDEXED,
+    name,
+    qualified_name,
+    docstring,
     tokenize='porter unicode61'
 );
 

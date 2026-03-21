@@ -23,9 +23,10 @@ class SymbolContext:
     annotations: list[dict[str, Any]] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     siblings: list[dict[str, Any]] = field(default_factory=list)
+    members: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "symbol": self.symbol,
             "callers": self.callers,
             "callees": self.callees,
@@ -34,6 +35,9 @@ class SymbolContext:
             "diagnostics": self.diagnostics,
             "siblings": self.siblings,
         }
+        if self.members:
+            d["members"] = self.members
+        return d
 
 
 class QueryEngine:
@@ -74,6 +78,11 @@ class QueryEngine:
 
         sym = symbols[0]
         sid = sym["symbol_id"]
+
+        # Class-level aggregation
+        if sym["kind"] == "class":
+            return self._get_class_context(sym)
+
         ctx = SymbolContext(symbol=sym)
 
         # Callers — who calls this symbol?
@@ -190,6 +199,90 @@ class QueryEngine:
         except Exception:
             return None
 
+    def _get_class_context(self, class_sym: dict[str, Any]) -> SymbolContext:
+        """Aggregated context for a class: all members, external callers, categorized callees."""
+        sid = class_sym["symbol_id"]
+        class_name = class_sym["name"]
+        ctx = SymbolContext(symbol=class_sym)
+
+        # Get all member methods/functions
+        member_rows = self.db._conn.execute(
+            """SELECT s.*, f.rel_path, p.name as parent_name, p.kind as parent_kind
+               FROM symbols s JOIN files f ON s.file_id = f.file_id
+               LEFT JOIN symbols p ON s.parent_id = p.symbol_id
+               WHERE s.parent_id = ? ORDER BY s.line_start""",
+            (sid,),
+        ).fetchall()
+        members = [self.db._symbol_row_to_dict(r) for r in member_rows]
+        member_names = {m["name"] for m in members}
+
+        # Members list with brief info
+        ctx.members = [{
+            "name": m["name"], "kind": m["kind"],
+            "line_start": m["line_start"], "line_end": m["line_end"],
+            "params": m.get("params"), "return_type": m.get("return_type"),
+            "is_async": m.get("is_async", False),
+            "docstring": (m.get("docstring") or "")[:80] or None,
+        } for m in members]
+
+        # Aggregate external callers across all members (excluding self-calls)
+        all_callers = []
+        seen_callers = set()
+        for method_name in [class_name] + sorted(member_names):
+            callers = self.db.get_callers(method_name, limit=30)
+            for c in callers:
+                if c.get("caller_class") == class_name:
+                    continue
+                key = (c.get("caller_name"), c.get("file"), c.get("line_no"))
+                if key not in seen_callers:
+                    seen_callers.add(key)
+                    c["via_member"] = method_name if method_name != class_name else "__init__"
+                    all_callers.append(c)
+        ctx.callers = all_callers
+
+        # Aggregate all callees from all methods, categorized
+        all_callees = []
+        for m in members:
+            callees = self.db.get_callees(m["symbol_id"])
+            for c in callees:
+                c["from_method"] = m["name"]
+                all_callees.append(c)
+        ctx.callees = self._categorize_callees(all_callees)
+
+        # Annotations on the class
+        ctx.annotations = self.db.get_annotations(symbol_id=sid)
+
+        # Diagnostics across all members
+        file_id_row = self.db._conn.execute(
+            "SELECT file_id FROM symbols WHERE symbol_id = ?", (sid,)
+        ).fetchone()
+        if file_id_row:
+            diag_rows = self.db._conn.execute(
+                """SELECT d.rule_id, d.severity, d.message, d.line_no
+                   FROM diagnostics d WHERE d.file_id = ? AND d.is_resolved = 0
+                   AND d.line_no BETWEEN ? AND ?""",
+                (file_id_row["file_id"],
+                 class_sym.get("line_start", 0), class_sym.get("line_end", 99999)),
+            ).fetchall()
+            ctx.diagnostics = [{
+                "rule_id": d["rule_id"], "severity": d["severity"],
+                "message": d["message"], "line_no": d["line_no"],
+            } for d in diag_rows]
+
+        # Siblings (other top-level symbols in the same file, not class members)
+        sibling_rows = self.db._conn.execute(
+            """SELECT s.name, s.kind, s.line_start, s.line_end
+               FROM symbols s WHERE s.file_id = ? AND s.parent_id IS NULL
+               AND s.symbol_id != ? ORDER BY s.line_start LIMIT 20""",
+            (class_sym.get("symbol_id"), sid),
+        ).fetchall()
+        ctx.siblings = [{
+            "name": s["name"], "kind": s["kind"],
+            "line_start": s["line_start"], "line_end": s["line_end"],
+        } for s in sibling_rows]
+
+        return ctx
+
     def get_impact(self, name: str) -> dict[str, Any]:
         """What breaks if I change this symbol?
 
@@ -294,17 +387,32 @@ class QueryEngine:
         }
 
     def search(self, query: str, kind: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
-        """Search for symbols by name. Returns only matching symbols, ranked by relevance.
+        """Search for symbols by name or keyword. Returns matching symbols, ranked by relevance.
 
-        Scoring: exact name match > prefix match > substring match > FTS file match.
+        Supports single-word exact/prefix/substring matches and multi-word keyword queries.
+        Scoring: exact name match > prefix > tokenized name matches > FTS docstring/name matches.
         """
+        import re
         results = []
+        seen_ids: set[int] = set()
 
-        # Symbol search (primary — this is what agents actually want)
+        def _add_result(r: dict[str, Any]) -> None:
+            sid = r.get("symbol_id")
+            if sid and sid in seen_ids:
+                return
+            if sid:
+                seen_ids.add(sid)
+            results.append(r)
+
+        # Tokenize query: split on whitespace, underscores, camelCase boundaries
+        tokens = re.split(r'[\s_]+', query.strip())
+        tokens = [t.lower() for t in tokens if t]
+        is_multi_word = len(tokens) > 1
+
+        # --- Strategy 1: Direct symbol name search (single query string) ---
         symbols = self.db.find_symbols(name=query, kind=kind, limit=limit * 2)
         for s in symbols:
             name = s["name"]
-            # Score: exact > prefix > substring
             if name == query:
                 score = 100
             elif name.startswith(query):
@@ -315,43 +423,78 @@ class QueryEngine:
                 score = 40
             else:
                 score = 10
-            results.append({
-                "type": "symbol",
-                "kind": s["kind"],
-                "name": s["name"],
-                "parent_name": s["parent_name"],
-                "file": s["file"],
-                "line_start": s["line_start"],
-                "line_end": s.get("line_end"),
+            _add_result({
+                "type": "symbol", "symbol_id": s["symbol_id"],
+                "kind": s["kind"], "name": s["name"],
+                "parent_name": s["parent_name"], "file": s["file"],
+                "line_start": s["line_start"], "line_end": s.get("line_end"),
                 "complexity": s.get("complexity"),
                 "docstring": (s.get("docstring") or "")[:100] or None,
                 "score": score,
             })
 
-        # FTS search — only if we have few symbol matches, and only extract
-        # individual symbol names that match (not the whole file)
+        # --- Strategy 2: Tokenized search (for multi-word queries) ---
+        if is_multi_word and len(results) < limit:
+            # Search each token individually and score by match count
+            token_hits: dict[int, dict] = {}  # symbol_id -> {symbol_data, matched_tokens}
+            for token in tokens:
+                token_symbols = self.db.find_symbols(name=token, kind=kind, limit=limit * 3)
+                for s in token_symbols:
+                    sid = s["symbol_id"]
+                    if sid not in token_hits:
+                        token_hits[sid] = {"symbol": s, "matched": set()}
+                    token_hits[sid]["matched"].add(token)
+
+            for sid, info in token_hits.items():
+                match_count = len(info["matched"])
+                if match_count < 1:
+                    continue
+                s = info["symbol"]
+                score = match_count * 20
+                _add_result({
+                    "type": "symbol", "symbol_id": s["symbol_id"],
+                    "kind": s["kind"], "name": s["name"],
+                    "parent_name": s["parent_name"], "file": s["file"],
+                    "line_start": s["line_start"], "line_end": s.get("line_end"),
+                    "complexity": s.get("complexity"),
+                    "docstring": (s.get("docstring") or "")[:100] or None,
+                    "score": score,
+                })
+
+        # --- Strategy 3: Symbol-level FTS (matches names + docstrings) ---
         if len(results) < limit:
-            fts_results = self.db.search_fts(query, limit=limit)
+            # Build FTS query: OR-join tokens for broad matching
+            fts_query = " OR ".join(tokens) if tokens else query
+            fts_results = self.db.search_symbol_fts(fts_query, limit=limit)
             for r in fts_results:
-                # Don't add FTS results for files we already have symbols from
-                files_seen = {res["file"] for res in results if res.get("file")}
+                if kind and r.get("kind") != kind:
+                    continue
+                _add_result({
+                    "type": "symbol", "symbol_id": r["symbol_id"],
+                    "kind": r["kind"], "name": r["name"],
+                    "parent_name": r.get("parent_name"), "file": r["file"],
+                    "line_start": r["line_start"], "line_end": r.get("line_end"),
+                    "complexity": r.get("complexity"),
+                    "docstring": r.get("docstring"),
+                    "score": r["score"] * 0.8,  # Slightly lower than direct symbol matches
+                })
+
+        # --- Strategy 4: File-level FTS fallback ---
+        if len(results) < limit:
+            fts_query = " OR ".join(tokens) if tokens else query
+            fts_results = self.db.search_fts(fts_query, limit=limit)
+            files_seen = {res.get("file") for res in results if res.get("file")}
+            for r in fts_results:
                 if r["rel_path"] not in files_seen:
                     results.append({
                         "type": "file",
                         "file": r["rel_path"],
-                        "score": r["score"] * 0.5,  # Lower priority than symbol matches
+                        "score": r["score"] * 0.3,
                     })
 
-        # Deduplicate and sort by score
-        seen = set()
-        unique = []
-        for r in sorted(results, key=lambda x: x.get("score", 0), reverse=True):
-            key = (r.get("name", ""), r.get("file", r.get("rel_path", "")))
-            if key not in seen:
-                seen.add(key)
-                unique.append(r)
-
-        return unique[:limit]
+        # Sort by score descending
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return results[:limit]
 
     def get_file_summary(self, rel_path: str) -> Optional[dict[str, Any]]:
         """Structured overview of a file."""

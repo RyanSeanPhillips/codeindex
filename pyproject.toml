@@ -32,6 +32,23 @@ dependencies = [
 
 [project.optional-dependencies]
 typescript = ["tree-sitter-typescript>=0.23"]
+powershell = ["tree-sitter-powershell>=0.26"]
+c = ["tree-sitter-c>=0.24"]
+cpp = ["tree-sitter-cpp>=0.23"]
+csharp = ["tree-sitter-c-sharp>=0.23"]
+go = ["tree-sitter-go>=0.25"]
+rust = ["tree-sitter-rust>=0.24"]
+java = ["tree-sitter-java>=0.23"]
+all-languages = [
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-powershell>=0.26",
+    "tree-sitter-c>=0.24",
+    "tree-sitter-cpp>=0.23",
+    "tree-sitter-c-sharp>=0.23",
+    "tree-sitter-go>=0.25",
+    "tree-sitter-rust>=0.24",
+    "tree-sitter-java>=0.23",
+]
 dev = ["pytest>=8.0", "pytest-cov"]
 
 [project.scripts]

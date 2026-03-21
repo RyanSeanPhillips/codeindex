@@ -112,7 +112,8 @@ TOOLS = [
                 },
                 "severity": {"type": "string", "enum": ["error", "warning", "info"]},
                 "rule_id": {"type": "string", "description": "Rule ID for rate/run_one"},
-                "file_pattern": {"type": "string", "description": "Filter by file path"},
+                "file_pattern": {"type": "string", "description": "Filter by file path (include)"},
+                "exclude_pattern": {"type": "string", "description": "Exclude files matching this pattern"},
                 "limit": {"type": "integer", "default": 50},
                 "rule_name": {"type": "string", "description": "Name for new rule (add_rule)"},
                 "rule_sql": {"type": "string", "description": "SQL query for new rule (add_rule)"},
@@ -255,15 +256,24 @@ class MCPServer:
         if action == "run":
             rule_id = args.get("rule_id")
             if rule_id:
-                count = self.rules.run_one(rule_id)
-                return {"rule_id": rule_id, "findings_count": count}
-            return self.rules.run_all()
+                self.rules.run_one(rule_id)
+            else:
+                self.rules.run_all()
+            # Return filtered diagnostics after running
+            return self.db.get_diagnostics(
+                severity=args.get("severity"),
+                rule_id=args.get("rule_id") if rule_id else None,
+                file_pattern=args.get("file_pattern"),
+                exclude_pattern=args.get("exclude_pattern"),
+                limit=args.get("limit", 50),
+            )
 
         elif action == "list":
             return self.db.get_diagnostics(
                 severity=args.get("severity"),
                 rule_id=args.get("rule_id"),
                 file_pattern=args.get("file_pattern"),
+                exclude_pattern=args.get("exclude_pattern"),
                 limit=args.get("limit", 50),
             )
 

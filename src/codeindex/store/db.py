@@ -313,6 +313,7 @@ class Database:
         severity: Optional[str] = None,
         rule_id: Optional[str] = None,
         file_pattern: Optional[str] = None,
+        exclude_pattern: Optional[str] = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         sql = """
@@ -331,6 +332,9 @@ class Database:
         if file_pattern:
             sql += " AND f.rel_path LIKE ?"
             params.append(f"%{file_pattern}%")
+        if exclude_pattern:
+            sql += " AND f.rel_path NOT LIKE ?"
+            params.append(f"%{exclude_pattern}%")
         sql += " ORDER BY CASE d.severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, f.rel_path, d.line_no LIMIT ?"
         params.append(limit)
 
@@ -467,6 +471,52 @@ class Database:
             "score": -r["rank"],
         } for r in rows]
 
+    # ── Symbol-level FTS ──
+
+    def update_symbol_fts(self, symbol_id: int, file_id: int,
+                          name: str, qualified_name: str, docstring: str) -> None:
+        self._conn.execute("DELETE FROM symbol_fts WHERE symbol_id = ?", (symbol_id,))
+        self._conn.execute(
+            "INSERT INTO symbol_fts (symbol_id, file_id, name, qualified_name, docstring) VALUES (?, ?, ?, ?, ?)",
+            (symbol_id, file_id, name, qualified_name, docstring or ""),
+        )
+
+    def clear_symbol_fts(self) -> None:
+        self._conn.execute("DELETE FROM symbol_fts")
+
+    def search_symbol_fts(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
+        """Search symbols via FTS5 — matches names and docstrings at symbol level."""
+        try:
+            rows = self._conn.execute(
+                """SELECT sf.symbol_id, sf.file_id, sf.name, sf.qualified_name,
+                          sf.docstring, rank,
+                          s.kind, s.line_start, s.line_end, s.complexity,
+                          f.rel_path, p.name as parent_name
+                   FROM symbol_fts sf
+                   JOIN symbols s ON sf.symbol_id = s.symbol_id
+                   JOIN files f ON sf.file_id = f.file_id
+                   LEFT JOIN symbols p ON s.parent_id = p.symbol_id
+                   WHERE symbol_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [{
+            "symbol_id": r["symbol_id"],
+            "name": r["name"],
+            "qualified_name": r["qualified_name"],
+            "kind": r["kind"],
+            "parent_name": r["parent_name"],
+            "file": r["rel_path"],
+            "line_start": r["line_start"],
+            "line_end": r["line_end"],
+            "complexity": r["complexity"],
+            "docstring": (r["docstring"] or "")[:100] or None,
+            "score": -r["rank"],
+        } for r in rows]
+
     # ── Knowledge cache ──
 
     def set_knowledge(self, key: str, value: Any) -> None:
@@ -512,7 +562,10 @@ class Database:
                 "line_start": s["line_start"],
                 "line_end": s["line_end"],
                 "complexity": s["complexity"],
-                "docstring": s["docstring"],
+                "params": json.loads(s["params_json"]),
+                "return_type": s["return_type"],
+                "is_async": bool(s["is_async"]),
+                "docstring": (s["docstring"] or "").split("\n")[0][:100] or None,
             } for s in symbols],
             "imports": [{
                 "module": i["module"],

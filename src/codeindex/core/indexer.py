@@ -109,6 +109,7 @@ class Indexer:
 
         # Clear all data
         self.db._conn.executescript("""
+            DELETE FROM symbol_fts;
             DELETE FROM fts;
             DELETE FROM diagnostics;
             DELETE FROM files;
@@ -244,10 +245,19 @@ class Indexer:
         if result.imports:
             self.db.bulk_insert_imports(file_id, result.imports)
 
-        # Update FTS
+        # Update FTS (file-level)
         symbol_names = " ".join(s.name for s in result.symbols)
         docstrings = " ".join(s.docstring or "" for s in result.symbols)
         self.db.update_fts(rel_path, symbol_names, docstrings.strip())
+
+        # Update symbol-level FTS
+        for sym in result.symbols:
+            parent = getattr(sym, "_pending_parent", None)
+            parent_name = parent.name if parent else None
+            qualified = f"{parent_name}.{sym.name}" if parent_name else sym.name
+            self.db.update_symbol_fts(
+                sym.symbol_id, file_id, sym.name, qualified, sym.docstring or "",
+            )
 
     def _store_file_error(self, abs_path: Path, rel_path: str, error: str):
         self.db.upsert_file(File(

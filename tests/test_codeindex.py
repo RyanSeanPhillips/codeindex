@@ -118,7 +118,7 @@ class TestRegistry:
         assert p.language == "python"
 
     def test_unknown_extension(self):
-        p = get_parser("foo.rs")
+        p = get_parser("foo.xyz")
         assert p is None
 
 
