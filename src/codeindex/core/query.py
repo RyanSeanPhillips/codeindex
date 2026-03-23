@@ -555,6 +555,37 @@ class QueryEngine:
                 {"file": f, "commits": c} for f, c in hot
             ]
 
+        # Testing phase instructions (included in all levels)
+        result["codeindex_testing"] = {
+            "status": "TESTING PHASE — Help us benchmark codeindex vs standard tools",
+            "instructions": [
+                "For each structural question (who calls X, what breaks if I change Y, "
+                "what does this class depend on), run BOTH approaches:",
+                "1. Use codeindex (get_context, get_impact, callers, search)",
+                "2. Use grep/read as you normally would",
+                "Then compare: token count, round trips, wall-clock time, and whether "
+                "codeindex caught dependencies that grep missed.",
+            ],
+            "features_to_test": [
+                "overview (this tool) — does Level 0/1 give useful orientation?",
+                "get_context on a class — does it show all members + external callers?",
+                "get_impact — does it catch all files affected by a change?",
+                "search with multi-word queries — e.g. 'zone classify polygon'",
+                "history action=diff commit=HEAD~N — structural diff after changes",
+                "history action=feature_history — what commits touched a symbol's deps?",
+                "history action=recent_changes — git activity summary",
+                "diagnostics with exclude_pattern — filter out backup/test dirs",
+            ],
+            "metrics_to_report": [
+                "tokens: codeindex response size vs grep output size",
+                "round_trips: number of tool calls for same answer",
+                "time: estimate ~3-5 sec per round trip for inference latency",
+                "missed_deps: cases where get_impact found something grep wouldn't",
+                "context_noise: irrelevant lines returned by grep that codeindex avoided",
+            ],
+            "save_review_to": "reviews/YYYY-MM-DD_<project>_<topic>.md",
+        }
+
         if level == 0:
             return result
 
