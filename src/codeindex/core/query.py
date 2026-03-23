@@ -500,6 +500,146 @@ class QueryEngine:
         """Structured overview of a file."""
         return self.db.get_file_summary(rel_path)
 
+    def get_overview(self, level: int = 1) -> dict[str, Any]:
+        """Project overview at configurable detail levels.
+
+        Level 0 (~200 tokens): project stats + recent git activity.
+        Level 1 (~600-1200 tokens): module map with key classes, cross-module deps.
+        """
+        from collections import defaultdict
+        from .git import GitIntegration
+
+        stats = self.db.get_stats()
+        git = GitIntegration(self.project_root) if self.project_root else None
+
+        # Languages breakdown
+        lang_rows = self.db._conn.execute(
+            "SELECT language, COUNT(*) as cnt FROM files GROUP BY language ORDER BY cnt DESC"
+        ).fetchall()
+        languages = {r["language"]: r["cnt"] for r in lang_rows}
+
+        # Parse error count
+        error_count = self.db._conn.execute(
+            "SELECT COUNT(*) FROM files WHERE parse_error IS NOT NULL"
+        ).fetchone()[0]
+
+        result: dict[str, Any] = {
+            "project_root": str(self.project_root) if self.project_root else None,
+            "files": stats.total_files,
+            "symbols": stats.total_symbols,
+            "classes": stats.total_classes,
+            "functions": stats.total_functions,
+            "languages": languages,
+            "parse_errors": error_count,
+            "health": {
+                "errors": stats.errors,
+                "warnings": stats.warnings,
+            },
+        }
+
+        # Git info
+        if git and git.available:
+            result["git"] = {
+                "head": git.get_short_hash(),
+                "recent_commits": git.get_log(limit=5),
+            }
+
+            # Hot files (most frequently changed recently)
+            log_with_files = git.get_log_with_files(limit=10)
+            file_counts: dict[str, int] = {}
+            for entry in log_with_files:
+                for f in entry.get("files", []):
+                    file_counts[f] = file_counts.get(f, 0) + 1
+            hot = sorted(file_counts.items(), key=lambda x: -x[1])[:5]
+            result["git"]["hot_files"] = [
+                {"file": f, "commits": c} for f, c in hot
+            ]
+
+        if level == 0:
+            return result
+
+        # --- Level 1: Module map with key classes ---
+        file_rows = self.db._conn.execute("""
+            SELECT f.rel_path, f.line_count,
+                   COUNT(DISTINCT s.symbol_id) as symbol_count,
+                   SUM(CASE WHEN s.kind = 'class' THEN 1 ELSE 0 END) as classes,
+                   SUM(CASE WHEN s.kind IN ('function', 'method') THEN 1 ELSE 0 END) as funcs
+            FROM files f
+            LEFT JOIN symbols s ON s.file_id = f.file_id
+            GROUP BY f.file_id
+            ORDER BY f.rel_path
+        """).fetchall()
+
+        modules: dict[str, dict] = defaultdict(lambda: {
+            "files": 0, "lines": 0, "symbols": 0, "classes": 0, "funcs": 0,
+        })
+        for r in file_rows:
+            path = r["rel_path"]
+            parts = path.split("/")
+            module = parts[0] if len(parts) > 1 else "(root)"
+            m = modules[module]
+            m["files"] += 1
+            m["lines"] += r["line_count"]
+            m["symbols"] += r["symbol_count"] or 0
+            m["classes"] += r["classes"] or 0
+            m["funcs"] += r["funcs"] or 0
+
+        # Key classes per module (top 5 by method count)
+        for mod_name, mod_info in modules.items():
+            if mod_info["classes"] == 0:
+                continue
+            pattern = f"{mod_name}/%" if mod_name != "(root)" else "%"
+            class_rows = self.db._conn.execute("""
+                SELECT s.name, s.line_start, s.line_end,
+                       (SELECT COUNT(*) FROM symbols m
+                        WHERE m.parent_id = s.symbol_id) as method_count
+                FROM symbols s
+                JOIN files f ON s.file_id = f.file_id
+                WHERE s.kind = 'class' AND f.rel_path LIKE ?
+                ORDER BY method_count DESC LIMIT 5
+            """, (pattern,)).fetchall()
+            mod_info["key_classes"] = [{
+                "name": c["name"],
+                "methods": c["method_count"],
+                "lines": c["line_end"] - c["line_start"],
+            } for c in class_rows]
+
+        # Cross-module dependencies from imports
+        import_rows = self.db._conn.execute("""
+            SELECT f.rel_path, i.module
+            FROM imports i JOIN files f ON i.file_id = f.file_id
+            WHERE i.is_from = 1 AND i.module IS NOT NULL
+        """).fetchall()
+
+        module_deps: dict[str, set] = defaultdict(set)
+        module_names = set(modules.keys())
+        for r in import_rows:
+            src_parts = r["rel_path"].split("/")
+            src_module = src_parts[0] if len(src_parts) > 1 else "(root)"
+            imp = r["module"] or ""
+            for mod_name in module_names:
+                if mod_name != "(root)" and (mod_name in imp or imp.startswith(mod_name)):
+                    if mod_name != src_module:
+                        module_deps[src_module].add(mod_name)
+
+        result["modules"] = {}
+        for mod_name in sorted(modules.keys()):
+            m = modules[mod_name]
+            mod_dict: dict[str, Any] = {
+                "files": m["files"],
+                "lines": m["lines"],
+                "classes": m["classes"],
+                "functions": m["funcs"],
+            }
+            if m.get("key_classes"):
+                mod_dict["key_classes"] = m["key_classes"]
+            deps = module_deps.get(mod_name)
+            if deps:
+                mod_dict["depends_on"] = sorted(deps)
+            result["modules"][mod_name] = mod_dict
+
+        return result
+
     def get_imports_graph(self, file_pattern: Optional[str] = None) -> dict[str, Any]:
         """Build an import dependency graph."""
         sql = """

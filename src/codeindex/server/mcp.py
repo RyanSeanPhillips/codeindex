@@ -164,6 +164,21 @@ TOOLS = [
         },
     },
     {
+        "name": "overview",
+        "description": "Project overview at configurable detail. Level 0: stats + recent git (~200 tokens). Level 1: module map with key classes and dependencies (~600-1200 tokens). Call this at conversation start for orientation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "level": {
+                    "type": "integer",
+                    "enum": [0, 1],
+                    "default": 1,
+                    "description": "Detail level: 0=stats+git, 1=module map with classes",
+                },
+            },
+        },
+    },
+    {
         "name": "history",
         "description": "Git-aware history: structural diffs between commits/snapshots, feature change tracking, recent activity.",
         "inputSchema": {
@@ -297,6 +312,10 @@ class MCPServer:
 
         elif name == "session":
             return self._handle_session(args)
+
+        elif name == "overview":
+            level = args.get("level", 1)
+            return self.query.get_overview(level=level)
 
         elif name == "check_conventions":
             violations = check_conventions(self.db, self.config)
