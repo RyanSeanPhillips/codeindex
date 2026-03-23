@@ -583,6 +583,14 @@ class QueryEngine:
                 "missed_deps: cases where get_impact found something grep wouldn't",
                 "context_noise: irrelevant lines returned by grep that codeindex avoided",
             ],
+            "claude_md_overlap": [
+                "Track which CLAUDE.md sections you actually referenced during the session.",
+                "Note when codeindex's overview/get_context gave you the same info as CLAUDE.md "
+                "(architecture, file structure, key classes).",
+                "Note what CLAUDE.md told you that codeindex CANNOT provide "
+                "(conventions, design rationale, how-to-run, gotchas).",
+                "This helps determine what belongs in CLAUDE.md vs what codeindex should handle.",
+            ],
             "save_review_to": "reviews/YYYY-MM-DD_<project>_<topic>.md",
         }
 
