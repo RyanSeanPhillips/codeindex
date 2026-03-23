@@ -16,6 +16,8 @@ from ..config import ProjectConfig
 from ..core.indexer import Indexer
 from ..core.query import QueryEngine
 from ..core.differ import Differ
+from ..core.git import GitIntegration
+from ..core.snapshot import SnapshotManager
 from ..rules.conventions import check_conventions
 from ..rules.engine import RuleEngine
 from ..sessions.tracker import SessionTracker
@@ -41,7 +43,7 @@ TOOLS = [
     },
     {
         "name": "get_context",
-        "description": "Get full context for a symbol: callers, callees, refs, annotations, diagnostics. THE primary tool for understanding code.",
+        "description": "Get full context for a symbol: callers, callees, refs, annotations, diagnostics. THE primary tool for understanding code. Returns empty if not indexed — run 'index' first.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -53,7 +55,7 @@ TOOLS = [
     },
     {
         "name": "callers",
-        "description": "Who calls this function/method? Returns caller name, class, file, and line number for each call site.",
+        "description": "Who calls this function/method? Returns caller name, class, file, and line number for each call site. Requires index.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -65,7 +67,7 @@ TOOLS = [
     },
     {
         "name": "get_impact",
-        "description": "What breaks if I change this symbol? Shows direct callers, transitive callers, affected files.",
+        "description": "What breaks if I change this symbol? Shows direct callers, transitive callers, affected files. Requires index.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -76,7 +78,7 @@ TOOLS = [
     },
     {
         "name": "search",
-        "description": "Full-text + structured search across the codebase. Finds symbols, files, and docstrings.",
+        "description": "Full-text + structured search across the codebase. Finds symbols, files, and docstrings. Requires index.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -89,7 +91,7 @@ TOOLS = [
     },
     {
         "name": "file_summary",
-        "description": "Get structured overview of a file: symbols, imports, diagnostics.",
+        "description": "Get structured overview of a file: symbols, imports, diagnostics. Requires index.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -161,6 +163,26 @@ TOOLS = [
             "properties": {},
         },
     },
+    {
+        "name": "history",
+        "description": "Git-aware history: structural diffs between commits/snapshots, feature change tracking, recent activity.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["diff", "feature_history", "recent_changes", "snapshots"],
+                    "default": "recent_changes",
+                    "description": "Action to perform",
+                },
+                "commit": {"type": "string", "description": "Git commit/ref for diff (e.g. 'HEAD~5', 'abc123')"},
+                "snapshot": {"type": "string", "description": "Snapshot name/ID for diff"},
+                "symbol_name": {"type": "string", "description": "Symbol name for feature_history"},
+                "since": {"type": "string", "description": "Time range, e.g. '1 week', '3 days'"},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    },
 ]
 
 
@@ -182,7 +204,9 @@ class MCPServer:
         self.rules = RuleEngine(self.db)
         self.differ = Differ(self.db, self.indexer)
         self.sessions = SessionTracker(self.db)
-        self.history = SessionHistory(self.db, self.differ)
+        self.session_history = SessionHistory(self.db, self.differ)
+        self.git = GitIntegration(self.project_root)
+        self.snapshots = SnapshotManager(self.db, self.project_root)
 
         # Seed built-in rules on first run
         self.rules.seed_builtins()
@@ -200,26 +224,61 @@ class MCPServer:
             mode = args.get("mode", "incremental")
             if mode == "full":
                 stats = self.indexer.full_rebuild()
-                # Run diagnostics after rebuild
                 diag_results = self.rules.run_all()
-                return {"stats": asdict(stats), "diagnostics_run": diag_results}
+                response = {"stats": asdict(stats), "diagnostics_run": diag_results}
             else:
                 result = self.indexer.incremental()
                 if sum(result.values()) > 0:
                     self.rules.run_all()
-                return result
+                response = result
+
+            # Surface parse error details when errors exist
+            error_count = self.db._conn.execute(
+                "SELECT COUNT(*) FROM files WHERE parse_error IS NOT NULL"
+            ).fetchone()[0]
+            if error_count > 0:
+                error_files = self.db._conn.execute(
+                    "SELECT rel_path, language, parse_error FROM files WHERE parse_error IS NOT NULL LIMIT 5"
+                ).fetchall()
+                response["parse_error_details"] = [{
+                    "file": r["rel_path"], "language": r["language"],
+                    "error": r["parse_error"],
+                } for r in error_files]
+                if error_count > 5:
+                    response["parse_error_details"].append(
+                        {"note": f"... and {error_count - 5} more"}
+                    )
+                sym_count = self.db._conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+                if sym_count == 0:
+                    response["hint"] = (
+                        "All files failed to parse. Check that required tree-sitter packages "
+                        "are installed: pip install codeindex[all-languages]"
+                    )
+            return response
 
         elif name == "get_context":
+            warning = self._check_index_populated()
+            if warning:
+                return warning
             ctx = self.query.get_context(args["name"], kind=args.get("kind"))
             return ctx.to_dict()
 
         elif name == "callers":
+            warning = self._check_index_populated()
+            if warning:
+                return warning
             return self.query.get_callers(args["name"], limit=args.get("limit", 50))
 
         elif name == "get_impact":
+            warning = self._check_index_populated()
+            if warning:
+                return warning
             return self.query.get_impact(args["name"])
 
         elif name == "search":
+            warning = self._check_index_populated()
+            if warning:
+                return warning
             return self.query.search(
                 args["query"], kind=args.get("kind"), limit=args.get("limit", 20),
             )
@@ -246,6 +305,9 @@ class MCPServer:
                 "total": len(violations),
                 "has_layers": bool(self.config.layers),
             }
+
+        elif name == "history":
+            return self._handle_history(args)
 
         else:
             raise ValueError(f"Unknown tool: {name}")
@@ -372,7 +434,7 @@ class MCPServer:
             session = self.sessions.end(summary=args.get("summary"))
             if session:
                 # Record changes
-                changes = self.history.record_snapshot(session.session_id)
+                changes = self.session_history.record_snapshot(session.session_id)
                 return {
                     "session_id": session.session_id,
                     "ended_at": session.ended_at,
@@ -384,7 +446,7 @@ class MCPServer:
         elif action == "status":
             active = self.sessions.get_active()
             if active:
-                changes = self.history.current_changes()
+                changes = self.session_history.current_changes()
                 return {
                     "session_id": active.session_id,
                     "started_at": active.started_at,
@@ -396,13 +458,103 @@ class MCPServer:
         elif action == "changes":
             active = self.sessions.get_active()
             if active:
-                return self.history.current_changes()
+                return self.session_history.current_changes()
             return []
 
         elif action == "history":
             return self.sessions.get_history()
 
         raise ValueError(f"Unknown session action: {action}")
+
+    def _handle_history(self, args: dict) -> Any:
+        action = args.get("action", "recent_changes")
+
+        if action == "diff":
+            commit = args.get("commit")
+            snapshot = args.get("snapshot")
+            if commit:
+                result = self.snapshots.diff_from_git(commit)
+            elif snapshot:
+                result = self.snapshots.diff_from_snapshot(snapshot)
+            else:
+                raise ValueError("Either 'commit' or 'snapshot' required for diff action")
+            return result.to_dict()
+
+        elif action == "feature_history":
+            symbol_name = args.get("symbol_name")
+            if not symbol_name:
+                raise ValueError("'symbol_name' required for feature_history action")
+            since = args.get("since", "1 week")
+            limit = args.get("limit", 20)
+
+            # Get symbol's dependency cone
+            ctx = self.query.get_context(symbol_name)
+            if not ctx.symbol:
+                return {"error": f"Symbol '{symbol_name}' not found in index"}
+
+            # Collect file paths from the dependency cone
+            files = set()
+            if ctx.symbol.get("file"):
+                files.add(ctx.symbol["file"])
+            for c in ctx.callers:
+                if c.get("file"):
+                    files.add(c["file"])
+            for c in ctx.callees:
+                if c.get("file"):
+                    files.add(c["file"])
+
+            # Query git for commits touching those files
+            commits = self.git.get_log(since=since, paths=list(files), limit=limit)
+
+            return {
+                "symbol": symbol_name,
+                "file": ctx.symbol.get("file"),
+                "dependency_cone_files": sorted(files),
+                "commits": commits,
+            }
+
+        elif action == "recent_changes":
+            since = args.get("since", "1 week")
+            limit = args.get("limit", 20)
+            commits = self.git.get_log_with_files(since=since, limit=limit)
+            return {
+                "git_available": self.git.available,
+                "commits": commits,
+                "total": len(commits),
+            }
+
+        elif action == "snapshots":
+            limit = args.get("limit", 20)
+            return self.snapshots.list_snapshots(limit=limit)
+
+        raise ValueError(f"Unknown history action: {action}")
+
+    def _check_index_populated(self) -> Optional[dict]:
+        """Check if the index has data. Returns warning dict if empty, None if OK."""
+        count = self.db._conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        if count == 0:
+            return {
+                "warning": "Index is empty. Run the 'index' tool first to build the code index.",
+                "hint": "Use: index with mode='full' for first-time indexing.",
+            }
+        sym_count = self.db._conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        if sym_count == 0:
+            error_count = self.db._conn.execute(
+                "SELECT COUNT(*) FROM files WHERE parse_error IS NOT NULL"
+            ).fetchone()[0]
+            if error_count > 0:
+                error_files = self.db._conn.execute(
+                    "SELECT rel_path, parse_error FROM files WHERE parse_error IS NOT NULL LIMIT 5"
+                ).fetchall()
+                return {
+                    "warning": f"Index has {count} files but 0 symbols — all files failed to parse.",
+                    "parse_errors": [{
+                        "file": r["rel_path"], "error": r["parse_error"],
+                    } for r in error_files],
+                    "hint": "Check that the required tree-sitter grammar packages are installed. "
+                            "E.g.: pip install tree-sitter-typescript tree-sitter-powershell",
+                }
+        return None
 
     def run(self):
         """Run the MCP server loop (stdio)."""

@@ -617,6 +617,69 @@ class Database:
             parse_errors=parse_errors,
         )
 
+    # ── Snapshot operations ──
+
+    def insert_snapshot(self, name: str, git_commit: Optional[str],
+                        symbols_json: str, calls_json: str) -> int:
+        cur = self._conn.execute(
+            """INSERT INTO snapshots (name, git_commit, created_at, symbols_json, calls_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (name, git_commit, self._now(), symbols_json, calls_json),
+        )
+        return cur.lastrowid
+
+    def get_snapshot(self, name_or_id) -> Optional[dict[str, Any]]:
+        """Get a snapshot by name or ID."""
+        if isinstance(name_or_id, int):
+            row = self._conn.execute(
+                "SELECT * FROM snapshots WHERE snapshot_id = ?", (name_or_id,)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM snapshots WHERE name = ? OR git_commit = ?",
+                (str(name_or_id), str(name_or_id)),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "snapshot_id": row["snapshot_id"],
+            "name": row["name"],
+            "git_commit": row["git_commit"],
+            "created_at": row["created_at"],
+            "symbols_json": row["symbols_json"],
+            "calls_json": row["calls_json"],
+        }
+
+    def list_snapshots(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT snapshot_id, name, git_commit, created_at,
+                      LENGTH(symbols_json) as symbols_size,
+                      LENGTH(calls_json) as calls_size
+               FROM snapshots ORDER BY created_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [{
+            "snapshot_id": r["snapshot_id"],
+            "name": r["name"],
+            "git_commit": r["git_commit"],
+            "created_at": r["created_at"],
+            "size_kb": round((r["symbols_size"] + r["calls_size"]) / 1024, 1),
+        } for r in rows]
+
+    def delete_old_snapshots(self, keep: int = 20) -> int:
+        """Delete oldest snapshots beyond the keep limit. Returns count deleted."""
+        count = self._conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        if count <= keep:
+            return 0
+        to_delete = count - keep
+        self._conn.execute(
+            """DELETE FROM snapshots WHERE snapshot_id IN (
+                SELECT snapshot_id FROM snapshots ORDER BY created_at ASC LIMIT ?
+            )""",
+            (to_delete,),
+        )
+        return to_delete
+
     # ── Raw SQL (for rule engine) ──
 
     def execute_sql(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:

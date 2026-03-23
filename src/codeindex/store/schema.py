@@ -175,6 +175,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
     tokenize='porter unicode61'
 );
 
+-- Structural snapshots for diff comparison
+CREATE TABLE IF NOT EXISTS snapshots (
+    snapshot_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT UNIQUE,
+    git_commit   TEXT,
+    created_at   TEXT NOT NULL,
+    symbols_json TEXT NOT NULL,
+    calls_json   TEXT NOT NULL
+);
+
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,

@@ -129,6 +129,10 @@ class Indexer:
             "files_indexed": stats.total_files,
         })
 
+        # Auto-snapshot and record git commit
+        self._record_git_state()
+        self._auto_snapshot()
+
         return stats
 
     def incremental(self) -> dict[str, int]:
@@ -157,7 +161,13 @@ class Indexer:
                     self._index_file(abs_path, rel_path)
                     changed += 1
 
-        return {"changed": changed, "added": added, "removed": removed}
+        result = {"changed": changed, "added": added, "removed": removed}
+
+        if sum(result.values()) > 0:
+            self._record_git_state()
+            self._auto_snapshot()
+
+        return result
 
     def reindex_file(self, rel_path: str) -> bool:
         """Re-index a single file."""
@@ -258,6 +268,27 @@ class Indexer:
             self.db.update_symbol_fts(
                 sym.symbol_id, file_id, sym.name, qualified, sym.docstring or "",
             )
+
+    def _record_git_state(self):
+        """Store current HEAD commit hash for git-accelerated incremental."""
+        try:
+            from .git import GitIntegration
+            git = GitIntegration(self.project_root)
+            if git.available:
+                commit = git.get_head_commit()
+                if commit:
+                    self.db.set_knowledge("last_indexed_commit", commit)
+        except Exception:
+            pass
+
+    def _auto_snapshot(self):
+        """Create an auto-snapshot of the current index state."""
+        try:
+            from .snapshot import SnapshotManager
+            sm = SnapshotManager(self.db, self.project_root)
+            sm.create_snapshot()
+        except Exception:
+            pass
 
     def _store_file_error(self, abs_path: Path, rel_path: str, error: str):
         self.db.upsert_file(File(
